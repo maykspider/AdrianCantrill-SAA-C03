@@ -1,20 +1,16 @@
-name: Build PDFs (one per subfolder)
+name: Convert Markdown to PDF (per file)
 
 on:
   workflow_dispatch:
     inputs:
       root_dir:
-        description: "Root folder to scan for Markdown subfolders (e.g., docs)"
+        description: "Root folder to scan for Markdown files (use '.' for repo root)"
         required: true
-        default: "docs"
+        default: "."
       output_dir:
-        description: "Where to place generated PDFs"
+        description: "Folder to store generated PDFs (artifact will contain this)"
         required: true
         default: "pdfs"
-      include_root:
-        description: "Also generate a PDF for root_dir itself if it has .md files"
-        required: true
-        default: "true"
 
 jobs:
   build:
@@ -32,73 +28,71 @@ jobs:
       - name: Install md-to-pdf
         run: npm i -g md-to-pdf
 
-      - name: Build one PDF per subfolder
+      - name: Convert each .md to .pdf (preserve names + folder structure)
         shell: bash
         run: |
           set -euo pipefail
 
           ROOT="${{ inputs.root_dir }}"
           OUT="${{ inputs.output_dir }}"
-          INCLUDE_ROOT="${{ inputs.include_root }}"
 
           if [[ ! -d "$ROOT" ]]; then
             echo "Root directory '$ROOT' not found."
+            echo "Tip: If your Markdown files are at repo root, use root_dir='.'."
             exit 1
           fi
 
           mkdir -p "$OUT"
 
-          # Collect unique directories that contain at least one .md file
-          mapfile -t DIRS < <(find "$ROOT" -type f -name '*.md' -printf '%h\n' | sort -u)
+          echo "Scanning for .md files under: $ROOT"
+          count=0
 
-          # Optionally exclude the root folder itself
-          if [[ "$INCLUDE_ROOT" != "true" ]]; then
-            DIRS=("${DIRS[@]/$ROOT}")
-            # Remove empty entries
-            DIRS=($(printf "%s\n" "${DIRS[@]}" | sed '/^$/d'))
-          fi
+          # Find all markdown files recursively
+          while IFS= read -r -d '' file; do
+            count=$((count+1))
+            dir="$(dirname "$file")"
+            base="$(basename "$file" .md)"
 
-          if [[ ${#DIRS[@]} -eq 0 ]]; then
-            echo "No markdown files found under '$ROOT'."
-            exit 0
-          fi
-
-          echo "Found ${#DIRS[@]} folder(s) with markdown under '$ROOT'."
-
-          for d in "${DIRS[@]}"; do
-            # d might be empty if filtered oddly
-            [[ -z "$d" ]] && continue
-
-            # Build a safe output name based on path relative to ROOT
-            if [[ "$d" == "$ROOT" ]]; then
-              rel="root"
-            else
-              rel="${d#"$ROOT"/}"
+            # Compute path relative to ROOT to preserve structure in OUT
+            rel_dir="${dir#"$ROOT"/}"
+            if [[ "$dir" == "$ROOT" || "$ROOT" == "." ]]; then
+              # If ROOT is '.' then keep rel_dir as the actual dir relative to repo
+              if [[ "$ROOT" == "." ]]; then
+                rel_dir="${dir#./}"
+              else
+                rel_dir="."
+              fi
             fi
 
-            # Replace slashes/spaces with underscores for filename safety
-            safe="$(echo "$rel" | tr '/ ' '__')"
-            outpdf="$OUT/${safe}.pdf"
+            out_sub="$OUT/$rel_dir"
+            mkdir -p "$out_sub"
 
-            echo "==> Building: $outpdf from folder: $d"
+            echo "[$count] Converting: $file"
 
-            # Concatenate markdown files in alphabetical order.
-            # Add separators between files to avoid accidental formatting merges.
-            # Use --basedir so relative images resolve from that folder.
+            # IMPORTANT:
+            # md-to-pdf generates the PDF next to the source file by default. [1](https://elephas.app/blog/notebooklm-source-limits)
+            # We run it from the file's directory so relative assets resolve naturally.
             (
-              for f in "$d"/*.md; do
-                [[ -f "$f" ]] || continue
-                echo -e "\n\n<!-- FILE: $f -->\n\n"
-                cat "$f"
-                echo -e "\n\n---\n\n"
-              done
-            ) | md-to-pdf --basedir "$d" > "$outpdf"
-          done
+              cd "$dir"
+              md-to-pdf "$(basename "$file")" --basedir "$dir"
+            )
 
-          echo "Done. PDFs saved in: $OUT"
+            # Move the generated PDF into output directory preserving structure
+            if [[ -f "$dir/$base.pdf" ]]; then
+              mv "$dir/$base.pdf" "$out_sub/$base.pdf"
+            else
+              echo "ERROR: Expected PDF was not generated for $file"
+              exit 1
+            fi
+          done < <(find "$ROOT" -type f -name '*.md' -print0)
+
+          echo "Converted $count Markdown file(s)."
+          echo "PDF output folder: $OUT"
+          echo "Listing generated PDFs:"
+          find "$OUT" -type f -name '*.pdf' -print -exec ls -lh {} \;
 
       - name: Upload PDFs as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pdfs-per-folder
+          name: pdfs-per-file
           path: ${{ inputs.output_dir }}
