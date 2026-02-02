@@ -1,0 +1,104 @@
+name: Build PDFs (one per subfolder)
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_dir:
+        description: "Root folder to scan for Markdown subfolders (e.g., docs)"
+        required: true
+        default: "docs"
+      output_dir:
+        description: "Where to place generated PDFs"
+        required: true
+        default: "pdfs"
+      include_root:
+        description: "Also generate a PDF for root_dir itself if it has .md files"
+        required: true
+        default: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install md-to-pdf
+        run: npm i -g md-to-pdf
+
+      - name: Build one PDF per subfolder
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="${{ inputs.root_dir }}"
+          OUT="${{ inputs.output_dir }}"
+          INCLUDE_ROOT="${{ inputs.include_root }}"
+
+          if [[ ! -d "$ROOT" ]]; then
+            echo "Root directory '$ROOT' not found."
+            exit 1
+          fi
+
+          mkdir -p "$OUT"
+
+          # Collect unique directories that contain at least one .md file
+          mapfile -t DIRS < <(find "$ROOT" -type f -name '*.md' -printf '%h\n' | sort -u)
+
+          # Optionally exclude the root folder itself
+          if [[ "$INCLUDE_ROOT" != "true" ]]; then
+            DIRS=("${DIRS[@]/$ROOT}")
+            # Remove empty entries
+            DIRS=($(printf "%s\n" "${DIRS[@]}" | sed '/^$/d'))
+          fi
+
+          if [[ ${#DIRS[@]} -eq 0 ]]; then
+            echo "No markdown files found under '$ROOT'."
+            exit 0
+          fi
+
+          echo "Found ${#DIRS[@]} folder(s) with markdown under '$ROOT'."
+
+          for d in "${DIRS[@]}"; do
+            # d might be empty if filtered oddly
+            [[ -z "$d" ]] && continue
+
+            # Build a safe output name based on path relative to ROOT
+            if [[ "$d" == "$ROOT" ]]; then
+              rel="root"
+            else
+              rel="${d#"$ROOT"/}"
+            fi
+
+            # Replace slashes/spaces with underscores for filename safety
+            safe="$(echo "$rel" | tr '/ ' '__')"
+            outpdf="$OUT/${safe}.pdf"
+
+            echo "==> Building: $outpdf from folder: $d"
+
+            # Concatenate markdown files in alphabetical order.
+            # Add separators between files to avoid accidental formatting merges.
+            # Use --basedir so relative images resolve from that folder.
+            (
+              for f in "$d"/*.md; do
+                [[ -f "$f" ]] || continue
+                echo -e "\n\n<!-- FILE: $f -->\n\n"
+                cat "$f"
+                echo -e "\n\n---\n\n"
+              done
+            ) | md-to-pdf --basedir "$d" > "$outpdf"
+          done
+
+          echo "Done. PDFs saved in: $OUT"
+
+      - name: Upload PDFs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfs-per-folder
+          path: ${{ inputs.output_dir }}
