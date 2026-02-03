@@ -1,10 +1,10 @@
-name: Build PDFs from Markdown (folders + optional root)
+name: Build PDFs from Markdown (recursive)
 
 on:
   workflow_dispatch:
     inputs:
       include_root:
-        description: "Also generate a single PDF for the repository root (includes ALL markdown recursively)"
+        description: "Generate root.pdf (includes ALL markdown recursively)"
         required: false
         default: "true"
       output_dir:
@@ -16,9 +16,10 @@ on:
         required: false
         default: "false"
       pdf_engine:
-        description: "PDF engine (xelatex recommended for Unicode/fonts)"
+        description: "PDF engine (xelatex recommended)"
         required: false
         default: "xelatex"
+
   push:
     branches: ["main"]
     paths-ignore:
@@ -35,20 +36,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Generate PDFs (Pandoc in Docker)
+      - name: Build PDFs (Pandoc + LaTeX container)
         env:
-          INCLUDE_ROOT: ${{ inputs.include_root || 'true' }}
-          OUTPUT_DIR: ${{ inputs.output_dir || 'generated-pdf' }}
-          COMMIT_BACK: ${{ inputs.commit_back || 'false' }}
-          PDF_ENGINE: ${{ inputs.pdf_engine || 'xelatex' }}
+          INCLUDE_ROOT: ${{ github.event.inputs.include_root || 'true' }}
+          OUTPUT_DIR: ${{ github.event.inputs.output_dir || 'generated-pdf' }}
+          COMMIT_BACK: ${{ github.event.inputs.commit_back || 'false' }}
+          PDF_ENGINE: ${{ github.event.inputs.pdf_engine || 'xelatex' }}
         run: |
-          set -euo pipefail
+          set -eu
 
-          echo "INCLUDE_ROOT=${INCLUDE_ROOT}"
-          echo "OUTPUT_DIR=${OUTPUT_DIR}"
-          echo "PDF_ENGINE=${PDF_ENGINE}"
+          echo "INCLUDE_ROOT=$INCLUDE_ROOT"
+          echo "OUTPUT_DIR=$OUTPUT_DIR"
+          echo "PDF_ENGINE=$PDF_ENGINE"
+          echo "COMMIT_BACK=$COMMIT_BACK"
 
-          # Run inside pandoc/latex container (includes LaTeX needed for PDF output) [2](https://github.com/pandoc/pandoc-action-example)
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/data" \
             -w /data \
@@ -57,204 +58,157 @@ jobs:
             -e PDF_ENGINE="${PDF_ENGINE}" \
             pandoc/latex:3.8 \
             /bin/sh -lc '
-              set -euo pipefail
+              set -eu
 
-              # Install tools we rely on (bash, findutils, coreutils)
-              # pandoc/latex images vary; this makes the script robust.
-              if command -v apk >/dev/null 2>&1; then
-                apk add --no-cache bash coreutils findutils >/dev/null
-              elif command -v apt-get >/dev/null 2>&1; then
-                apt-get update -y >/dev/null
-                apt-get install -y bash coreutils findutils >/dev/null
-              fi
+              OUTPUT_DIR="${OUTPUT_DIR:-generated-pdf}"
+              INCLUDE_ROOT="${INCLUDE_ROOT:-true}"
+              PDF_ENGINE="${PDF_ENGINE:-xelatex}"
 
-              bash -lc "
-                set -euo pipefail
+              mkdir -p "$OUTPUT_DIR"
 
-                OUTPUT_DIR=\${OUTPUT_DIR:-generated-pdf}
-                INCLUDE_ROOT=\${INCLUDE_ROOT:-true}
-                PDF_ENGINE=\${PDF_ENGINE:-xelatex}
+              # Exclude common dirs + output dir itself (generalized)
+              # Add/remove patterns as needed.
+              EX1="*/.git/*"
+              EX2="*/.github/*"
+              EX3="*/node_modules/*"
+              EX4="*/dist/*"
+              EX5="*/build/*"
+              EX6="*/target/*"
+              EX7="*/vendor/*"
+              EX8="*/${OUTPUT_DIR}/*"
 
-                # Exclusions (common repo folders + the output folder itself)
-                # You can extend this list for any repo.
-                EXCLUDE_DIRS=(.git .github node_modules dist build target vendor \${OUTPUT_DIR})
+              collect_md() {
+                base="$1"
+                # Collect markdown recursively, excluding common dirs
+                find "$base" -type f -name "*.md" \
+                  ! -path "$EX1" ! -path "$EX2" ! -path "$EX3" ! -path "$EX4" \
+                  ! -path "$EX5" ! -path "$EX6" ! -path "$EX7" ! -path "$EX8" \
+                  | LC_ALL=C sort
+              }
 
-                mkdir -p \"\${OUTPUT_DIR}\"
+              build_resource_path_from_listfile() {
+                listfile="$1"
+                # resource-path includes repo root + each markdown file directory (unique) joined with :
+                {
+                  echo "."
+                  while IFS= read -r f; do
+                    d=$(dirname "$f")
+                    echo "$d"
+                  done < "$listfile"
+                } | awk "!seen[\$0]++ { out = (out==\"\" ? \$0 : out\":\"\$0) } END { print out }"
+              }
 
-                # Helper: build a find prune expression from EXCLUDE_DIRS
-                build_prune_args() {
-                  local args=()
-                  for d in \"\${EXCLUDE_DIRS[@]}\"; do
-                    args+=( -path \"./\${d}\" -o -path \"./\${d}/*\" -o )
-                  done
-                  # remove trailing -o
-                  unset \"args[\${#args[@]}-1]\"
-                  echo \"\${args[@]}\"
-                }
+              build_combined_md() {
+                base="$1"
+                listfile="$2"
+                tmpmd="$3"
 
-                PRUNE_ARGS=\$(build_prune_args)
+                # Title
+                if [ "$base" = "." ]; then
+                  echo "# root" > "$tmpmd"
+                else
+                  echo "# $(basename "$base")" > "$tmpmd"
+                fi
+                echo "" >> "$tmpmd"
 
-                # Helper: collect markdown files under a directory (recursive), excluding pruned dirs
-                # Sorted for deterministic output ordering.
-                collect_md_files() {
-                  local base=\"\$1\"
-                  if [[ \"\$base\" == \".\" ]]; then
-                    # All repo markdown
-                    eval find . \\( \$PRUNE_ARGS \\) -prune -o -type f -name \"*.md\" -print | sort
+                # Add each file with an H1 heading => bookmarks / outline entries
+                while IFS= read -r f; do
+                  # Label is path relative to base (or repo root)
+                  if [ "$base" = "." ]; then
+                    label="${f#./}"
                   else
-                    # Under subfolder (recursive)
-                    eval find \"\$base\" \\( \$PRUNE_ARGS \\) -prune -o -type f -name \"*.md\" -print | sort
+                    label="${f#"$base"/}"
                   fi
-                }
+                  echo "# $label" >> "$tmpmd"
+                  echo "" >> "$tmpmd"
+                  cat "$f" >> "$tmpmd"
+                  echo "" >> "$tmpmd"
+                  echo "" >> "$tmpmd"
+                done < "$listfile"
+              }
 
-                # Helper: create a robust resource path list (colon-separated) for pandoc images.
-                # Pandoc often needs --resource-path when images aren't in the working dir. [3](https://stackoverflow.com/questions/74685574/image-file-path-error-while-using-pandoc-for-markdown-to-pdf-conversion)[4](https://github.com/jgm/pandoc/discussions/9315)
-                build_resource_path() {
-                  local files=(\"\$@\")
-                  local dirs=(\".\")
+              build_pdf_for_scope() {
+                base="$1"           # "." or "folder"
+                outpdf="$2"          # output path
+                title="$3"           # metadata title
 
-                  for f in \"\${files[@]}\"; do
-                    dirs+=(\"\$(dirname \"\$f\")\")
-                  done
+                listfile="$(mktemp)"
+                tmpmd="$(mktemp)"
 
-                  # unique directories
-                  local uniq=()
-                  local seen=\"\"
-                  for d in \"\${dirs[@]}\"; do
-                    if [[ \";\$seen;\" != *\";\$d;\"* ]]; then
-                      uniq+=(\"\$d\")
-                      seen+=\"\$d;\"
-                    fi
-                  done
+                collect_md "$base" > "$listfile"
 
-                  (IFS=:; echo \"\${uniq[*]}\")
-                }
-
-                # Helper: safe title from a folder name
-                folder_title() {
-                  local p=\"\$1\"
-                  [[ \"\$p\" == \".\" ]] && echo \"root\" || basename \"\$p\"
-                }
-
-                # Helper: build a single combined markdown with a top-level heading before each file
-                # This ensures PDF bookmarks per file (headings become outline entries in many viewers). [5](https://learnbyexample.github.io/customizing-pandoc/)
-                build_combined_md() {
-                  local base_dir=\"\$1\"
-                  shift
-                  local files=(\"\$@\")
-                  local tmp=\"\$(mktemp)\"
-
-                  {
-                    echo \"% Auto-generated by GitHub Actions\"
-                    echo \"# \$(folder_title \"\$base_dir\")\"
-                    echo
-
-                    for f in \"\${files[@]}\"; do
-                      # Relative label (nice bookmark text)
-                      local label=\"\$f\"
-                      if [[ \"\$base_dir\" != \".\" ]]; then
-                        # make path relative to folder pdf root
-                        label=\"\${f#\$base_dir/}\"
-                      else
-                        label=\"\${f#./}\"
-                      fi
-
-                      echo \"# \${label}\"
-                      echo
-                      cat \"\$f\"
-                      echo -e \"\\n\\n\"
-                    done
-                  } > \"\$tmp\"
-
-                  echo \"\$tmp\"
-                }
-
-                # Build one PDF per FIRST-LEVEL directory, recursively including nested markdown files
-                # (Your requested behavior: nested .md included, output named after sub-folder)
-                shopt -s nullglob
-                for dir in */ ; do
-                  dir=\"\${dir%/}\"
-
-                  # Skip excluded directories
-                  skip=false
-                  for ex in \"\${EXCLUDE_DIRS[@]}\"; do
-                    [[ \"\$dir\" == \"\$ex\" ]] && skip=true && break
-                  done
-                  \$skip && continue
-
-                  mapfile -t files < <(collect_md_files \"\$dir\")
-                  [[ \${#files[@]} -eq 0 ]] && continue
-
-                  res_path=\$(build_resource_path \"\${files[@]}\")
-                  tmp_md=\$(build_combined_md \"\$dir\" \"\${files[@]}\")
-                  out_pdf=\"\${OUTPUT_DIR}/\${dir}.pdf\"
-
-                  echo \"==> Building \${out_pdf} (files: \${#files[@]})\"
-
-                  # pandoc combines inputs into a single output document [1](http://pandoc.org/MANUAL.html)
-                  pandoc --from gfm \
-                         --standalone \
-                         --toc \
-                         --pdf-engine=\"\$PDF_ENGINE\" \
-                         --metadata title=\"\$dir\" \
-                         --resource-path=\"\$res_path\" \
-                         -o \"\$out_pdf\" \
-                         \"\$tmp_md\"
-
-                  rm -f \"\$tmp_md\"
-                done
-
-                # Optional: root PDF (includes ALL markdown recursively)
-                if [[ \"\$INCLUDE_ROOT\" == \"true\" || \"\$INCLUDE_ROOT\" == \"True\" || \"\$INCLUDE_ROOT\" == \"1\" ]]; then
-                  mapfile -t root_files < <(collect_md_files \".\")
-                  if [[ \${#root_files[@]} -gt 0 ]]; then
-                    res_path=\$(build_resource_path \"\${root_files[@]}\")
-                    tmp_md=\$(build_combined_md \".\" \"\${root_files[@]}\")
-                    out_pdf=\"\${OUTPUT_DIR}/root.pdf\"
-
-                    echo \"==> Building \${out_pdf} (files: \${#root_files[@]})\"
-
-                    pandoc --from gfm \
-                           --standalone \
-                           --toc \
-                           --pdf-engine=\"\$PDF_ENGINE\" \
-                           --metadata title=\"root\" \
-                           --resource-path=\"\$res_path\" \
-                           -o \"\$out_pdf\" \
-                           \"\$tmp_md\"
-
-                    rm -f \"\$tmp_md\"
-                  else
-                    echo \"No markdown files found for root PDF.\"
-                  fi
+                # If no files, skip
+                if [ ! -s "$listfile" ]; then
+                  echo "No markdown files under $base"
+                  rm -f "$listfile" "$tmpmd"
+                  return 0
                 fi
 
-                echo
-                echo \"Generated PDFs:\"
-                ls -lah \"\${OUTPUT_DIR}\" || true
-              "
+                respath="$(build_resource_path_from_listfile "$listfile")"
+                build_combined_md "$base" "$listfile" "$tmpmd"
+
+                echo "==> Building $outpdf"
+                pandoc --from gfm \
+                  --standalone \
+                  --toc \
+                  --pdf-engine="$PDF_ENGINE" \
+                  --metadata title="$title" \
+                  --resource-path="$respath" \
+                  -o "$outpdf" \
+                  "$tmpmd"
+
+                rm -f "$listfile" "$tmpmd"
+              }
+
+              # 1) One PDF per first-level folder (recursively includes nested md)
+              find . -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort | while IFS= read -r d; do
+                d="${d#./}"
+
+                # skip excluded top-level folders
+                case "$d" in
+                  .git|.github|node_modules|dist|build|target|vendor|"$OUTPUT_DIR")
+                    continue
+                    ;;
+                esac
+
+                outpdf="${OUTPUT_DIR}/${d}.pdf"
+                build_pdf_for_scope "$d" "$outpdf" "$d"
+              done
+
+              # 2) Optional: root.pdf including all md recursively
+              case "$INCLUDE_ROOT" in
+                true|True|1|yes|YES|y|Y)
+                  build_pdf_for_scope "." "${OUTPUT_DIR}/root.pdf" "root"
+                  ;;
+                *)
+                  echo "Skipping root.pdf (INCLUDE_ROOT=$INCLUDE_ROOT)"
+                  ;;
+              esac
+
+              echo ""
+              echo "Generated PDFs:"
+              ls -lah "$OUTPUT_DIR" || true
             '
 
-      - name: Upload PDFs as workflow artifact
+      - name: Upload PDFs as artifact
         uses: actions/upload-artifact@v4
         with:
           name: generated-pdfs
-          path: ${{ inputs.output_dir || 'generated-pdf' }}/
+          path: ${{ github.event.inputs.output_dir || 'generated-pdf' }}/
 
-      - name: Commit generated PDFs back to repo (optional)
-        if: ${{ (inputs.commit_back || 'false') == 'true' }}
+      - name: Commit PDFs back to repo (optional)
+        if: ${{ (github.event.inputs.commit_back || 'false') == 'true' }}
         run: |
-          set -euo pipefail
-          OUT="${{ inputs.output_dir || 'generated-pdf' }}"
+          set -eu
+          OUT="${{ github.event.inputs.output_dir || 'generated-pdf' }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Avoid infinite rebuild loops by ignoring output path in triggers (already set in paths-ignore)
-          if [[ -n "$(git status --porcelain "$OUT")" ]]; then
+          if [ -n "$(git status --porcelain "$OUT")" ]; then
             git add "$OUT"
             git commit -m "chore: update generated PDFs"
             git push
           else
-            echo "No changes in $OUT to commit."
+            echo "No changes to commit."
           fi
