@@ -50,14 +50,17 @@ jobs:
           echo "PDF_ENGINE=$PDF_ENGINE"
           echo "COMMIT_BACK=$COMMIT_BACK"
 
+          # Use pandoc/latex for PDF output (Pandoc + LaTeX toolchain) [1](https://github.com/pandoc/pandoc-action-example)[2](http://pandoc.org/MANUAL.html)
+          # IMPORTANT: override entrypoint so '-lc' is interpreted by /bin/sh, not by pandoc.
           docker run --rm \
+            --entrypoint /bin/sh \
             -v "${GITHUB_WORKSPACE}:/data" \
             -w /data \
             -e INCLUDE_ROOT="${INCLUDE_ROOT}" \
             -e OUTPUT_DIR="${OUTPUT_DIR}" \
             -e PDF_ENGINE="${PDF_ENGINE}" \
             pandoc/latex:3.8 \
-            /bin/sh -lc '
+            -lc '
               set -eu
 
               OUTPUT_DIR="${OUTPUT_DIR:-generated-pdf}"
@@ -66,8 +69,7 @@ jobs:
 
               mkdir -p "$OUTPUT_DIR"
 
-              # Exclude common dirs + output dir itself (generalized)
-              # Add/remove patterns as needed.
+              # Exclude common directories + output dir (generalized)
               EX1="*/.git/*"
               EX2="*/.github/*"
               EX3="*/node_modules/*"
@@ -79,136 +81,26 @@ jobs:
 
               collect_md() {
                 base="$1"
-                # Collect markdown recursively, excluding common dirs
                 find "$base" -type f -name "*.md" \
                   ! -path "$EX1" ! -path "$EX2" ! -path "$EX3" ! -path "$EX4" \
                   ! -path "$EX5" ! -path "$EX6" ! -path "$EX7" ! -path "$EX8" \
                   | LC_ALL=C sort
               }
 
+              # Pandoc image resolution often needs --resource-path when images are not in CWD. [3](https://stackoverflow.com/questions/74685574/image-file-path-error-while-using-pandoc-for-markdown-to-pdf-conversion)[4](https://github.com/jgm/pandoc/discussions/9315)
               build_resource_path_from_listfile() {
                 listfile="$1"
-                # resource-path includes repo root + each markdown file directory (unique) joined with :
                 {
                   echo "."
                   while IFS= read -r f; do
-                    d=$(dirname "$f")
-                    echo "$d"
+                    dirname "$f"
                   done < "$listfile"
                 } | awk "!seen[\$0]++ { out = (out==\"\" ? \$0 : out\":\"\$0) } END { print out }"
               }
 
+              # Inject a top-level heading before each file => PDF outline/bookmarks in many viewers. [5](https://learnbyexample.github.io/customizing-pandoc/)
               build_combined_md() {
                 base="$1"
                 listfile="$2"
                 tmpmd="$3"
 
-                # Title
-                if [ "$base" = "." ]; then
-                  echo "# root" > "$tmpmd"
-                else
-                  echo "# $(basename "$base")" > "$tmpmd"
-                fi
-                echo "" >> "$tmpmd"
-
-                # Add each file with an H1 heading => bookmarks / outline entries
-                while IFS= read -r f; do
-                  # Label is path relative to base (or repo root)
-                  if [ "$base" = "." ]; then
-                    label="${f#./}"
-                  else
-                    label="${f#"$base"/}"
-                  fi
-                  echo "# $label" >> "$tmpmd"
-                  echo "" >> "$tmpmd"
-                  cat "$f" >> "$tmpmd"
-                  echo "" >> "$tmpmd"
-                  echo "" >> "$tmpmd"
-                done < "$listfile"
-              }
-
-              build_pdf_for_scope() {
-                base="$1"           # "." or "folder"
-                outpdf="$2"          # output path
-                title="$3"           # metadata title
-
-                listfile="$(mktemp)"
-                tmpmd="$(mktemp)"
-
-                collect_md "$base" > "$listfile"
-
-                # If no files, skip
-                if [ ! -s "$listfile" ]; then
-                  echo "No markdown files under $base"
-                  rm -f "$listfile" "$tmpmd"
-                  return 0
-                fi
-
-                respath="$(build_resource_path_from_listfile "$listfile")"
-                build_combined_md "$base" "$listfile" "$tmpmd"
-
-                echo "==> Building $outpdf"
-                pandoc --from gfm \
-                  --standalone \
-                  --toc \
-                  --pdf-engine="$PDF_ENGINE" \
-                  --metadata title="$title" \
-                  --resource-path="$respath" \
-                  -o "$outpdf" \
-                  "$tmpmd"
-
-                rm -f "$listfile" "$tmpmd"
-              }
-
-              # 1) One PDF per first-level folder (recursively includes nested md)
-              find . -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort | while IFS= read -r d; do
-                d="${d#./}"
-
-                # skip excluded top-level folders
-                case "$d" in
-                  .git|.github|node_modules|dist|build|target|vendor|"$OUTPUT_DIR")
-                    continue
-                    ;;
-                esac
-
-                outpdf="${OUTPUT_DIR}/${d}.pdf"
-                build_pdf_for_scope "$d" "$outpdf" "$d"
-              done
-
-              # 2) Optional: root.pdf including all md recursively
-              case "$INCLUDE_ROOT" in
-                true|True|1|yes|YES|y|Y)
-                  build_pdf_for_scope "." "${OUTPUT_DIR}/root.pdf" "root"
-                  ;;
-                *)
-                  echo "Skipping root.pdf (INCLUDE_ROOT=$INCLUDE_ROOT)"
-                  ;;
-              esac
-
-              echo ""
-              echo "Generated PDFs:"
-              ls -lah "$OUTPUT_DIR" || true
-            '
-
-      - name: Upload PDFs as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-pdfs
-          path: ${{ github.event.inputs.output_dir || 'generated-pdf' }}/
-
-      - name: Commit PDFs back to repo (optional)
-        if: ${{ (github.event.inputs.commit_back || 'false') == 'true' }}
-        run: |
-          set -eu
-          OUT="${{ github.event.inputs.output_dir || 'generated-pdf' }}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [ -n "$(git status --porcelain "$OUT")" ]; then
-            git add "$OUT"
-            git commit -m "chore: update generated PDFs"
-            git push
-          else
-            echo "No changes to commit."
-          fi
